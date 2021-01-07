@@ -46,6 +46,10 @@ void netvsc_switch_datapath(struct net_device *ndev, bool vf)
 	struct netvsc_device *nv_dev = rtnl_dereference(net_device_ctx->nvdev);
 	struct nvsp_message *init_pkt = &nv_dev->channel_init_pkt;
 
+	/* Block sending traffic to VF if it's about to be gone */
+	if (!vf)
+		net_device_ctx->data_path_is_vf = vf;
+
 	memset(init_pkt, 0, sizeof(struct nvsp_message));
 	init_pkt->hdr.msg_type = NVSP_MSG4_TYPE_SWITCH_DATA_PATH;
 	if (vf)
@@ -60,7 +64,10 @@ void netvsc_switch_datapath(struct net_device *ndev, bool vf)
 	vmbus_sendpacket(dev->channel, init_pkt,
 			       sizeof(struct nvsp_message),
 			       (unsigned long)init_pkt,
-			       VM_PKT_DATA_INBAND, 0);
+			       VM_PKT_DATA_INBAND,
+			       VMBUS_DATA_PACKET_FLAG_COMPLETION_REQUESTED);
+	wait_for_completion(&nv_dev->channel_init_wait);
+	net_device_ctx->data_path_is_vf = vf;
 }
 
 /* Worker to setup sub channels on initial setup
@@ -740,6 +747,21 @@ static void netvsc_send_completion(struct net_device *ndev,
 				   int budget)
 {
 	const struct nvsp_message *nvsp_packet = hv_pkt_data(desc);
+	struct nvsp_message *init_pkt;
+
+	/* Check if this is a VMBUS completion without data payload */
+	if (!hv_pkt_datalen(desc)) {
+		init_pkt = (struct nvsp_message *)desc->trans_id;
+		switch (init_pkt->hdr.msg_type) {
+		case NVSP_MSG4_TYPE_SWITCH_DATA_PATH:
+			complete(&net_device->channel_init_wait);
+			break;
+
+		default:
+			netdev_err(ndev, "Unexpected VMBUS completion!!\n");
+		}
+		return;
+	}
 
 	switch (nvsp_packet->hdr.msg_type) {
 	case NVSP_MSG_TYPE_INIT_COMPLETE:
